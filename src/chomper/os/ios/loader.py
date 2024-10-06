@@ -2,9 +2,9 @@ import os
 from typing import Dict, List, Tuple, Optional
 
 import lief
-from lief.MachO import BIND_TYPES, ARM64_RELOCATION
+from lief.MachO import ARM64_RELOCATION
 
-from chomper.abc import BaseLoader
+from chomper.base import BaseLoader
 from chomper.types import Module, Symbol, Binding
 from chomper.utils import aligned
 
@@ -118,51 +118,49 @@ class MachoLoader(BaseLoader):
         lazy_bindings = []
 
         for binding in binary.dyld_info.bindings:
-            if binding.binding_type == BIND_TYPES.POINTER:
-                symbol = binding.symbol
-                symbol_name = str(symbol.name)
+            symbol = binding.symbol
+            symbol_name = str(symbol.name)
 
-                reloc_addr = self._get_symbol_reloc_addr(symbol_map, symbol_name)
+            reloc_addr = self._get_symbol_reloc_addr(symbol_map, symbol_name)
 
-                if not reloc_addr:
-                    lazy_binding = Binding(
-                        symbol=symbol_name,
-                        address=binding.address,
-                        addend=binding.addend,
-                    )
-                    lazy_bindings.append(lazy_binding)
+            if not reloc_addr:
+                lazy_binding = Binding(
+                    symbol=symbol_name,
+                    address=binding.address,
+                    addend=binding.addend,
+                )
+                lazy_bindings.append(lazy_binding)
 
-                    # Hook imports
-                    if self.emu.hooks.get(symbol_name):
-                        if not hooks_map.get(symbol_name):
-                            reloc_addr = self.emu.create_buffer(self.emu.arch.addr_size)
-                            hooks_map[symbol_name] = reloc_addr
+                # Hook imports
+                if self.emu.hooks.get(symbol_name):
+                    if not hooks_map.get(symbol_name):
+                        reloc_addr = self.emu.create_buffer(self.emu.arch.addr_size)
+                        hooks_map[symbol_name] = reloc_addr
 
-                            self.emu.add_interceptor(
-                                reloc_addr, self.emu.hooks[symbol_name]
-                            )
-
-                        else:
-                            reloc_addr = hooks_map[symbol_name]
-
-                        self.emu.logger.info(
-                            'Hook import symbol "{}" at {}'.format(
-                                symbol_name,
-                                self.emu.debug_symbol(symbol.binding_info.address),
-                            )
+                        self.emu.add_interceptor(
+                            reloc_addr, self.emu.hooks[symbol_name]
                         )
 
                     else:
-                        # self.emu.add_hook(
-                        #     reloc_addr,
-                        #     self._missing_symbol_required_callback,
-                        #     user_data={"symbol_name": symbol.name},
-                        # )
-                        continue
+                        reloc_addr = hooks_map[symbol_name]
 
-                if reloc_addr:
-                    value = (reloc_addr + binding.addend) & 0xFFFFFFFFFFFFFFFF
-                    self.emu.write_pointer(module_base + binding.address, value)
+                    self.emu.logger.info(
+                        'Hook import symbol "{}" at 0x{:x}'.format(
+                            symbol_name, symbol.binding_info.address
+                        )
+                    )
+
+                else:
+                    # self.emu.add_hook(
+                    #     reloc_addr,
+                    #     self._missing_symbol_required_callback,
+                    #     user_data={"symbol_name": symbol.name},
+                    # )
+                    continue
+
+            if reloc_addr:
+                value = (reloc_addr + binding.addend) & 0xFFFFFFFFFFFFFFFF
+                self.emu.write_pointer(module_base + binding.address, value)
 
         return lazy_bindings
 
@@ -212,7 +210,6 @@ class MachoLoader(BaseLoader):
 
         begin = module_base + section.virtual_address
         end = begin + section.size
-
         values = self.emu.read_array(begin, end)
 
         return [addr for addr in values if addr]

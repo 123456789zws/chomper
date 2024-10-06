@@ -5,12 +5,12 @@
 ![PyPI - Python Version](https://img.shields.io/pypi/pyversions/chomper)
 [![GitHub license](https://img.shields.io/github/license/sledgeh4w/chomper)](https://github.com/sledgeh4w/chomper/blob/main/LICENSE)
 
-Chomper is a lightweight emulation framework based on [Unicorn](https://github.com/unicorn-engine/unicorn). It is mainly used to emulate native programs on Android and iOS.
+Chomper is a lightweight emulation framework based on [Unicorn](https://github.com/unicorn-engine/unicorn). It is mainly used to emulate iOS executables and libraries. In addition, it also provides limited support for Android native libraries.
 
 ## Features
 
-- Basic emulation of ELF and Mach-O
-- Support for a set of iOS system libraries (from iOS SDK 14.4.0)
+- Basic emulation for ELF and Mach-O
+- Support for a set of iOS system libraries (from iOS 14.4.0)
 
 ## Requirements
 
@@ -25,7 +25,7 @@ $ pip install chomper
 
 ## Usage
 
-Emulate iOS executable files.
+Emulate iOS executables.
 
 ```python
 import uuid
@@ -33,7 +33,7 @@ import uuid
 from chomper import Chomper
 from chomper.const import ARCH_ARM64, OS_IOS
 
-# The system libraries will be automatically loaded from `rootfs_path` on iOS
+# For iOS, system libraries will be automatically loaded from `rootfs_path`
 emu = Chomper(
     arch=ARCH_ARM64,
     os_type=OS_IOS,
@@ -64,6 +64,7 @@ Working with Objective-C.
 ```python
 from chomper import Chomper
 from chomper.const import ARCH_ARM64, OS_IOS
+from chomper.objc import ObjC
 
 emu = Chomper(
     arch=ARCH_ARM64,
@@ -71,28 +72,21 @@ emu = Chomper(
     rootfs_path="examples/ios/rootfs",
 )
 
+objc = ObjC(emu)
+
 emu.load_module("examples/ios/apps/cn.com.scal.sichuanair/zsch")
 
-# The ObjC can only be used through c functions for now,
-# more friendly API will be probided in the future.
+# Use this context manager to ensure that Objective-C objects can be automatically released
+with objc.autorelease_pool():
+    # Construct NSString object
+    a1 = objc.msg_send("NSString", "stringWithUTF8String:", "test")
 
-# Get classes and selectors
-nsstring_cls = emu.call_symbol("_objc_getClass", emu.create_string("NSString"))
-string_with_utf8_string_sel = emu.call_symbol("_sel_registerName", emu.create_string("stringWithUTF8String:"))
-cstring_using_encoding_sel = emu.call_symbol("_sel_registerName", emu.create_string("cStringUsingEncoding:"))
+    # Call Objective-C method
+    req_sign = objc.msg_send("ZSCHRSA", "getReqSign:", a1)
 
-zschrsa_cls = emu.call_symbol("_objc_getClass", emu.create_string("ZSCHRSA"))
-get_req_sign_sel = emu.call_symbol("_sel_registerName", emu.create_string("getReqSign:"))
-
-# Construct NSString object
-a1 = emu.call_symbol("_objc_msgSend", nsstring_cls, string_with_utf8_string_sel, emu.create_string("test"))
-
-# Call ObjC method
-req_sign = emu.call_symbol("_objc_msgSend", zschrsa_cls, get_req_sign_sel, a1)
-
-# Convert NSString to C string
-result_ptr = emu.call_symbol("_objc_msgSend", req_sign, cstring_using_encoding_sel, 4)
-result = emu.read_string(result_ptr)
+    # Convert NSString object to C string
+    result_ptr = objc.msg_send(req_sign, "cStringUsingEncoding:", 4)
+    result = emu.read_string(result_ptr)
 ```
 
 Emulate Android native libraries.
@@ -108,7 +102,7 @@ emu.load_module("examples/android/rootfs/system/lib64/libc.so")
 emu.load_module("examples/android/rootfs/system/lib64/libz.so")
 
 libszstone = emu.load_module(
-    "examples/apps/android/com.shizhuang.duapp/libszstone.so",
+    "examples/android/apps/com.shizhuang.duapp/libszstone.so",
     exec_init_array=True,
 )
 
@@ -122,28 +116,5 @@ result_size = emu.call_address(libszstone.base + 0x2F1C8, a1, a2, a3)
 result = emu.read_bytes(a3, result_size)
 ```
 
-Hook instructions.
-
-```python
-def hook_code(uc, address, size, user_data):
-    pass
-
-symbol = emu.find_symbol("strlen")
-emu.add_hook(symbol.address, hook_code)
-```
-
-Trace instructions.
-
-```python
-# Trace all instructions
-emu = Chomper(arch=ARCH_ARM64, os_type=OS_ANDROID, trace_instr=True)
-
-# Trace instructions in this module
-emu.load_module("examples/android/rootfs/system/lib64/libc.so", trace_inst=True)
-```
-
-Execute initialization functions in section `.init_array`.
-
-```python
-emu.load_module("examples/android/apps/com.shizhuang.duapp/libszstone.so", exec_init_array=True)
-```
+## Examples
+[Here](https://github.com/sledgeh4w/chomper/tree/main/examples) are some encryption emulation examples for security vendors.

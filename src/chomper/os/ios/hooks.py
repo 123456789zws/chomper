@@ -3,11 +3,18 @@ import random
 import time
 import uuid
 from functools import wraps
-from typing import Dict
+from typing import Callable, Dict
 
-from unicorn.unicorn import UC_HOOK_CODE_TYPE
+from chomper.exceptions import SymbolMissingException
+from chomper.objc import ObjC
+from chomper.utils import pyobj2cfobj
 
-hooks: Dict[str, UC_HOOK_CODE_TYPE] = {}
+hooks: Dict[str, Callable] = {}
+
+
+def get_hooks() -> Dict[str, Callable]:
+    """Returns a dictionary of default hooks."""
+    return hooks.copy()
 
 
 def register_hook(symbol_name: str):
@@ -69,14 +76,20 @@ def hook_sysctlbyname(uc, address, size, user_data):
         emu.write_u64(oldp + 8, 0)
 
     elif name == "kern.osvariant_status":
+        variant_status = 0
+
+        # can_has_debugger = 3
+        variant_status |= 3 << 2
+
         # internal_release_type = 3
-        emu.write_u64(oldp, 0x30)
+        variant_status |= 3 << 4
+
+        emu.write_u64(oldp, variant_status)
 
     elif name == "hw.memsize":
         emu.write_u64(oldp, 4 * 1024 * 1024 * 1024)
 
     else:
-        emu.logger.info([emu.debug_symbol(t[0]) for t in emu.backtrace()])
         raise RuntimeError("Unhandled sysctl command: %s" % name)
 
     return 0
@@ -309,50 +322,6 @@ def hook_posix_memalign(uc, address, size, user_data):
     return 0
 
 
-@register_hook("_fopen")
-def hook_fopen(uc, address, size, user_data):
-    emu = user_data["emu"]
-
-    path = emu.read_string(emu.get_arg(0))
-    emu.logger.info("fopen: %s" % path)
-
-    return 0
-
-
-@register_hook("_getsectiondata")
-def hook_getsectiondata(uc, address, size, user_data):
-    emu = user_data["emu"]
-    module = emu.modules[-1]
-
-    section_name = emu.read_string(emu.get_arg(2))
-    size_ptr = emu.get_arg(3)
-
-    section = module.binary.get_section(section_name)
-    if not section:
-        return 0
-
-    emu.write_u64(size_ptr, section.size)
-
-    return module.base - module.image_base + section.virtual_address
-
-
-@register_hook("_getsegmentdata")
-def hook_getsegmentdata(uc, address, size, user_data):
-    emu = user_data["emu"]
-    module = emu.modules[-1]
-
-    segment_name = emu.read_string(emu.get_arg(1))
-    size_ptr = emu.get_arg(2)
-
-    segment = module.binary.get_segment(segment_name)
-    if not segment:
-        return 0
-
-    emu.write_u64(size_ptr, segment.virtual_size)
-
-    return module.base - module.image_base + segment.virtual_address
-
-
 @register_hook("__os_activity_initiate")
 def hook_os_activity_initiate(uc, address, size, user_data):
     return 0
@@ -363,18 +332,108 @@ def hook_notify_register_dispatch(uc, address, size, user_data):
     return 0
 
 
+@register_hook("_dlsym")
+def hook_dlsym(uc, address, size, user_data):
+    emu = user_data["emu"]
+
+    symbol_name = f"_{emu.read_string(emu.get_arg(1))}"
+
+    try:
+        symbol = emu.find_symbol(symbol_name)
+        return symbol.address
+    except SymbolMissingException:
+        pass
+
+    return 0
+
+
 @register_hook("_dyld_program_sdk_at_least")
 def hook_dyld_program_sdk_at_least(uc, address, size, user_data):
     return 0
 
 
-@register_hook("__ZN11objc_object16rootAutorelease2Ev")
-def hook_objc_object_root_autorelease(uc, address, size, user_data):
-    pass
-
-
 @register_hook("_dispatch_async")
 def hook_dispatch_async(uc, address, size, user_data):
+    return 0
+
+
+@register_hook("_uloc_getLanguage")
+def hook_uloc_get_language(uc, address, size, user_data):
+    return 0
+
+
+@register_hook("_uloc_getScript")
+def hook_uloc_get_script(uc, address, size, user_data):
+    return 0
+
+
+@register_hook("_uloc_getCountry")
+def hook_uloc_get_country(uc, address, size, user_data):
+    return 0
+
+
+@register_hook("_uloc_getVariant")
+def hook_uloc_get_variant(uc, address, size, user_data):
+    return 0
+
+
+@register_hook("_uloc_openKeywords")
+def hook_uloc_open_keywords(uc, address, size, user_data):
+    return 0
+
+
+@register_hook("_uloc_getDisplayName")
+def hook_uloc_get_display_name(uc, address, size, user_data):
+    return 0
+
+
+@register_hook("_uloc_getDisplayLanguage")
+def hook_uloc_get_display_language(uc, address, size, user_data):
+    return 0
+
+
+@register_hook("_uenum_next")
+def hook_uenum_next(uc, address, size, user_data):
+    return 0
+
+
+@register_hook("_uenum_close")
+def hook_uenum_close(uc, address, size, user_data):
+    return 0
+
+
+@register_hook("_os_log_type_enabled")
+def hook_os_log_type_enabled(uc, address, size, user_data):
+    return 0
+
+
+@register_hook("_MGCopyAnswer")
+def hook_mg_copy_answer(uc, address, size, user_data):
+    emu = user_data["emu"]
+    objc = ObjC(emu)
+
+    str_ptr = objc.msg_send(emu.get_arg(0), "cStringUsingEncoding:", 4)
+    key = emu.read_string(str_ptr)
+
+    if key in emu.os.device_info:
+        return pyobj2cfobj(emu, emu.os.device_info[key])
+
+    return 0
+
+
+@register_hook("__CFPreferencesCopyAppValueWithContainerAndConfiguration")
+def hook_cf_preferences_copy_app_value_with_container_and_configuration(
+    uc, address, size, user_data
+):
+    emu = user_data["emu"]
+    objc = ObjC(emu)
+
+    str_ptr = objc.msg_send(emu.get_arg(0), "cStringUsingEncoding:", 4)
+    key = emu.read_string(str_ptr)
+
+    if key in emu.os.preferences:
+        return pyobj2cfobj(emu, emu.os.preferences[key])
+
     return 0
 
 
@@ -383,6 +442,110 @@ def hook_cf_bundle_create_info_dict_from_main_executable(uc, address, size, user
     return 0
 
 
+@register_hook("___CFXPreferencesCopyCurrentApplicationStateWithDeadlockAvoidance")
+def hook_cf_x_preferences_copy_current_application_state_with_deadlock_avoidance(
+    uc, address, size, user_data
+):
+    emu = user_data["emu"]
+
+    return pyobj2cfobj(emu, emu.os.preferences)
+
+
+@register_hook("_CFNotificationCenterGetLocalCenter")
+def hook_cf_notification_center_get_local_center(uc, address, size, user_data):
+    return 0
+
+
+@register_hook("__CFPrefsClientLog")
+def hook_cf_prefs_client_log(uc, address, size, user_data):
+    return 0
+
+
 @register_hook("_NSLog")
 def hook_ns_log(uc, address, size, user_data):
+    return 0
+
+
+@register_hook("_SecItemAdd")
+def hook_sec_item_add(uc, address, size, user_data):
+    return 0
+
+
+@register_hook("_SecItemUpdate")
+def hook_sec_item_update(uc, address, size, user_data):
+    return 0
+
+
+@register_hook("_SecItemDelete")
+def hook_sec_item_delete(uc, address, size, user_data):
+    return 0
+
+
+@register_hook("_SecItemCopyMatching")
+def hook_sec_item_copy_matching(uc, address, size, user_data):
+    emu = user_data["emu"]
+    objc = ObjC(emu)
+
+    a1 = emu.get_arg(0)
+    a2 = emu.get_arg(1)
+
+    sec_return_data = objc.msg_send(
+        a1,
+        "objectForKey:",
+        emu.read_pointer(emu.find_symbol("_kSecReturnData").address),
+    )
+
+    sec_return_attributes = objc.msg_send(
+        a1,
+        "objectForKey:",
+        emu.read_pointer(emu.find_symbol("_kSecReturnAttributes").address),
+    )
+
+    sec_match_limit = objc.msg_send(
+        a1,
+        "objectForKey:",
+        emu.read_pointer(emu.find_symbol("_kSecMatchLimit").address),
+    )
+
+    cf_boolean_true = emu.read_pointer(emu.find_symbol("_kCFBooleanTrue").address)
+
+    sec_match_limit_all = emu.read_pointer(
+        emu.find_symbol("_kSecMatchLimitAll").address
+    )
+
+    if sec_match_limit == sec_match_limit_all:
+        result = pyobj2cfobj(emu, [])
+    elif sec_return_attributes == cf_boolean_true:
+        result = pyobj2cfobj(emu, {})
+    elif sec_return_data == cf_boolean_true:
+        result = pyobj2cfobj(emu, b"")
+    else:
+        result = 0
+
+    if a2:
+        emu.write_u64(a2, result)
+
+    return 0
+
+
+@register_hook("_mach_vm_allocate")
+def hook_mach_vm_allocate(uc, address, size, user_data):
+    emu = user_data["emu"]
+
+    addr = emu.get_arg(1)
+    size = emu.get_arg(2)
+
+    mem = emu.memory_manager.alloc(size)
+    emu.write_pointer(addr, mem)
+
+    return 0
+
+
+@register_hook("_mach_vm_deallocate")
+def hook_mach_vm_deallocate(uc, address, size, user_data):
+    emu = user_data["emu"]
+
+    mem = emu.get_arg(1)
+    emu.memory_manager.free(mem)
+
     return 0

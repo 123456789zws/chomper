@@ -1,5 +1,4 @@
 import logging
-import re
 from functools import wraps
 from typing import Callable, Dict, List, Optional, Tuple, Union
 
@@ -16,11 +15,11 @@ from unicorn import (
     arm64_const,
     arm_const,
 )
-from unicorn.unicorn import UC_HOOK_CODE_TYPE
 
 from . import const
 from .arch import arm_arch, arm64_arch
 from .exceptions import EmulatorCrashedException, SymbolMissingException
+from .instruction import AutomicInstruction
 from .memory import MemoryManager
 from .types import Module, Symbol
 from .log import get_logger
@@ -30,7 +29,7 @@ from .utils import aligned
 
 
 class Chomper:
-    """Lightweight emulation framework for emulating native programs on Android and iOS.
+    """Lightweight emulation framework for emulating iOS executables and libraries.
 
     Args:
         arch: The architecture to emulate, support ARM and ARM64.
@@ -42,7 +41,7 @@ class Chomper:
         enable_objc: Enable Objective-C runtime of iOS.
         enable_ui_kit: Enable UIKit framework of iOS.
         trace_inst: Print log when any instruction is executed. The emulator will
-            call disassembler in real time to display the assembly instructions,
+            call disassembler in real time to output the assembly instructions,
             so this will slow down the emulation.
         trace_symbol_calls: Print log when any symbol is called.
     """
@@ -81,7 +80,7 @@ class Chomper:
 
         self.modules: List[Module] = []
 
-        self.hooks: Dict[str, UC_HOOK_CODE_TYPE] = {}
+        self.hooks: Dict[str, Callable] = {}
         self.syscall_handlers: Dict[int, Callable] = {}
 
         self.memory_manager = MemoryManager(
@@ -190,10 +189,11 @@ class Chomper:
         if self.arch == arm_arch and enable_vfp:
             self._enable_vfp()
 
-    def _start_emulate(self, address: int, *args: int):
+    def _start_emulate(self, address: int, *args: int) -> int:
         """Start emulate at the specified address."""
+        context = self.uc.context_save()
+
         stop_addr = self.create_buffer(8)
-        # stop_addr = 0
 
         for index, value in enumerate(args):
             self.set_arg(index, value)
@@ -208,11 +208,18 @@ class Chomper:
             self.logger.info(f"Start emulate at {self.debug_symbol(address)}")
             self.uc.emu_start(address, stop_addr)
 
+            return self.get_retval()
+
         except UcError as e:
             self.crash("Unknown reason", from_exc=e)
 
         finally:
+            self.uc.context_restore(context)
+
             self.free(stop_addr)
+
+        # Pass type hints
+        return 0
 
     def find_module(self, name_or_addr: Union[str, int]) -> Optional[Module]:
         """Find module by name or address."""
@@ -275,7 +282,7 @@ class Chomper:
     def add_hook(
         self,
         symbol_or_addr: Union[int, str],
-        callback: UC_HOOK_CODE_TYPE,
+        callback: Callable,
         user_data: Optional[dict] = None,
     ) -> int:
         """Add hook to the emulator.
@@ -314,7 +321,7 @@ class Chomper:
     def add_interceptor(
         self,
         symbol_or_addr: Union[int, str],
-        callback: UC_HOOK_CODE_TYPE,
+        callback: Callable,
         user_data: Optional[dict] = None,
     ):
         """Add interceptor to the emulator."""
@@ -338,38 +345,33 @@ class Chomper:
         """Delete hook."""
         self.uc.hook_del(handle)
 
-    def log_registers(self):
-        """Log all register values."""
-        message = "Registers: "
-
-        for reg_index in range(31):
-            reg_id = getattr(arm64_const, f"UC_ARM64_REG_X{reg_index}")
-            reg_value = self.uc.reg_read(reg_id)
-
-            if reg_index:
-                message += ", "
-
-            message += f"x{reg_index}: 0x{reg_value:016x}"
-
-            if self.find_module(reg_value):
-                message += f" [{self.debug_symbol(reg_value)}]"
-
-        self.logger.info(message)
-
-    def log_trace(self):
-        """Log the trace stack."""
-        trace_stack = [self.debug_symbol(t[0]) for t in self.backtrace()]
-        message = "Trace stack: %s" % ", ".join(trace_stack)
-        self.logger.info(message)
-
     def crash(self, message: str, from_exc: Optional[Exception] = None):
         """Raise an emulator crashed exception and output debugging info.
 
         Raises:
             EmulatorCrashedException:
         """
-        self.log_registers()
-        self.log_trace()
+        # Log backtrace
+        trace_stack = [self.debug_symbol(t[0]) for t in self.backtrace()]
+        message_ = "Backtrace: %s" % ", ".join(trace_stack)
+        self.logger.info(message_)
+
+        # Log registers
+        message_ = "State: "
+
+        for reg_index in range(31):
+            reg_id = getattr(arm64_const, f"UC_ARM64_REG_X{reg_index}")
+            reg_value = self.uc.reg_read(reg_id)
+
+            if reg_index:
+                message_ += ", "
+
+            message_ += f"x{reg_index}: 0x{reg_value:016x}"
+
+            if self.find_module(reg_value):
+                message_ += f" [{self.debug_symbol(reg_value)}]"
+
+        self.logger.info(message_)
 
         address = self.uc.reg_read(self.arch.reg_pc)
         message = f"{message} at {self.debug_symbol(address)}"
@@ -379,12 +381,13 @@ class Chomper:
 
         raise EmulatorCrashedException(message)
 
-    def trace_symbol_call_callback(self, *args):
+    def trace_symbol_call_callback(
+        self, uc: Uc, address: int, size: int, user_data: dict
+    ):
         """Trace symbol call."""
-        user_data = args[-1]
         symbol = user_data["symbol"]
 
-        if self.arch == const.ARCH_ARM:
+        if self.arch == arm_arch:
             ret_addr = self.uc.reg_read(arm_const.UC_ARM_REG_LR)
         else:
             ret_addr = self.uc.reg_read(arm64_const.UC_ARM64_REG_LR)
@@ -427,13 +430,17 @@ class Chomper:
             return
 
         elif intno in (1, 4):
+            # Handle cpu exceptions
             address = self.uc.reg_read(self.arch.reg_pc)
-            inst = next(self.cs.disasm_lite(uc.mem_read(address, 4), 0))
-            result = self._handle_atomic_inst(inst)
+            code = uc.mem_read(address, 4)
 
-            if result:
+            try:
+                AutomicInstruction(self, code).execute()
                 self.uc.reg_write(arm64_const.UC_ARM64_REG_PC, address + 4)
                 return
+
+            except ValueError:
+                pass
 
         self.crash("Unhandled interruption %s" % (intno,))
 
@@ -452,105 +459,6 @@ class Chomper:
                 return
 
         self.crash("Unhandled system call")
-
-    def _handle_atomic_inst(self, inst: Tuple[int, int, str, str]) -> bool:
-        """Handle atomic instructions.
-
-        The iOS system libraries will use some atomic instructions from ARM v8.1.
-        However, Unicorn doesn't support these instructions, so we need to do some
-        simple simulation.
-
-        Returns:
-            True if the instruction is handled, False otherwise.
-        """
-        inst_set = ["ldxr", "ldadd", "ldset", "swp", "cas"]
-
-        if not any((inst[2].startswith(t) for t in inst_set)):
-            return False
-
-        match = re.match(r"(\w+), \[(\w+)]", inst[3])
-
-        if not match:
-            match = re.match(r"(\w+), (\w+), \[(\w+)]", inst[3])
-
-        if not match:
-            return False
-
-        if inst[2].endswith("b"):
-            op_bits = 8
-        elif re.search(r"w(\d+)", inst[3]):
-            op_bits = 32
-        else:
-            op_bits = 64
-
-        regs = []
-
-        for reg in match.groups():
-            attr = f"UC_ARM64_REG_{reg.upper()}"
-            regs.append(getattr(arm64_const, attr))
-
-        return self._exec_atomic_inst(inst[2], op_bits, regs)
-
-    def _exec_atomic_inst(self, inst: str, op_bits: int, regs: List[int]) -> bool:
-        """Execute an atomic instruction."""
-        exec_func_map = {
-            "ldxr": self._exec_inst_ldxr,
-            "ldadd": self._exec_inst_ldadd,
-            "ldset": self._exec_inst_ldset,
-            "swp": self._exec_inst_swp,
-            "cas": self._exec_inst_cas,
-        }
-
-        read_func = getattr(self, f"read_u{op_bits}")
-        write_func = getattr(self, f"write_u{op_bits}")
-
-        addr = self.uc.reg_read(regs[-1])
-        value = read_func(addr)
-
-        for key, exec_func in exec_func_map.items():
-            if inst.startswith(key):
-                result = exec_func(regs[0], regs[1], value)
-
-                if result is not None:
-                    write_func(addr, result % (2**op_bits))
-
-                return True
-
-        return False
-
-    def _exec_inst_ldxr(self, s: int, t: int, v: int) -> Optional[int]:
-        """Execute `ldxr` instruction."""
-        self.uc.reg_write(s, v)
-        return None
-
-    def _exec_inst_ldadd(self, s: int, t: int, v: int) -> Optional[int]:
-        """Execute `ldadd` instruction."""
-        self.uc.reg_write(t, v)
-        v += self.uc.reg_read(s)
-        return v
-
-    def _exec_inst_ldset(self, s: int, t: int, v: int) -> Optional[int]:
-        """Execute `ldset` instruction."""
-        self.uc.reg_write(t, v)
-        v |= self.uc.reg_read(s)
-        return v
-
-    def _exec_inst_swp(self, s: int, t: int, v: int) -> Optional[int]:
-        """Execute `swp` instruction."""
-        self.uc.reg_write(t, v)
-        v = self.uc.reg_read(s)
-        return v
-
-    def _exec_inst_cas(self, s: int, t: int, v: int) -> Optional[int]:
-        """Execute `cas` instruction."""
-        n = self.uc.reg_read(s)
-
-        self.uc.reg_write(s, v)
-
-        if n == v:
-            return self.uc.reg_read(t)
-
-        return None
 
     def add_inst_trace(self, module: Module):
         """Add instruction trace for the module."""
@@ -731,15 +639,28 @@ class Chomper:
     def read_string(self, address: int) -> str:
         """Read string from the address."""
         data = bytes()
-        offset = 0
 
-        while True:
-            byte = self.read_bytes(address + offset, 1)
-            if byte == b"\x00":
-                break
+        block_size = 1024
+        end = b"\x00"
 
-            data += byte
-            offset += 1
+        try:
+            while True:
+                buf = self.read_bytes(address, block_size)
+                if buf.find(end) != -1:
+                    data += buf[: buf.index(end)]
+                    break
+
+                data += buf
+                address += block_size
+
+        except UcError:
+            for i in range(block_size):
+                buf = self.read_bytes(address + i, 1)
+                if buf == end:
+                    break
+
+                data += buf
+                address += 1
 
         return data.decode("utf-8")
 
@@ -833,12 +754,8 @@ class Chomper:
         symbol = self.find_symbol(symbol_name)
         address = symbol.address
 
-        self._start_emulate(address, *args)
-
-        return self.get_retval()
+        return self._start_emulate(address, *args)
 
     def call_address(self, address: int, *args: int) -> int:
         """Call function at the address."""
-        self._start_emulate(address, *args)
-
-        return self.get_retval()
+        return self._start_emulate(address, *args)
